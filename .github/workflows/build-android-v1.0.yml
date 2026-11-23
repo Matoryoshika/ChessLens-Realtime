@@ -1,0 +1,190 @@
+name: Build ChessLens Realtime v1.0 - Arrow Geometry Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ChessLens-Realtime-v1.0*.zip'
+      - '.github/workflows/build-android-v1.0*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unpack latest v1.0 source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Accept suffixes such as (1), (2) without asking for file renames.
+          # Prefer the zip most recently committed to the repository.
+          archive="$(python3 - <<'PYSELECT'
+          from pathlib import Path
+          import subprocess
+          matches=list(Path('.').glob('ChessLens-Realtime-v1.0*.zip'))
+          if not matches:
+              raise SystemExit('Missing ChessLens v1.0 ZIP in repository root')
+          def uploaded_at(path):
+              timestamp = subprocess.check_output(['git','log','-1','--format=%ct','--',str(path)],text=True).strip()
+              return (int(timestamp or '0'), path.name)
+          print(max(matches,key=uploaded_at))
+          PYSELECT
+          )"
+          echo "Selected latest uploaded source: $archive"
+          test -s "$archive"
+          unzip -oq "$archive" -d .
+          test -f app/src/main/java/id/chesslens/realtime/overlay/ArrowCanvas.java
+          test -f app/src/main/java/id/chesslens/realtime/vision/PositionTracker.java
+          test -f app/src/main/java/id/chesslens/realtime/ScreenService.java
+          test -f app/src/main/java/id/chesslens/realtime/engine/UciEngine.java
+          grep -q "versionName '1.0'" app/build.gradle
+          grep -q 'versionCode 13' app/build.gradle
+          grep -q "abiFilters 'arm64-v8a'" app/build.gradle
+          grep -q 'analyzeBothTurns' app/src/main/java/id/chesslens/realtime/ScreenService.java
+          grep -q 'pollLine(long timeoutMs)' app/src/main/java/id/chesslens/realtime/engine/WasmEngineHost.java
+          grep -q 'recentPieces' app/src/main/java/id/chesslens/realtime/vision/PieceClassifier.java
+          grep -q 'attachForService(this)' app/src/main/java/id/chesslens/realtime/ScreenService.java
+          grep -q 'restartServiceHost(Service service)' app/src/main/java/id/chesslens/realtime/engine/WasmEngineHost.java
+          grep -q 'findMatchingTwoPlies(currentBoard, placement)' app/src/main/java/id/chesslens/realtime/vision/PositionTracker.java
+          grep -q 'activeMove = valid(myMove)' app/src/main/java/id/chesslens/realtime/overlay/ArrowCanvas.java
+          grep -q 'ArrowGeometry.align(frame::getPixel' app/src/main/java/id/chesslens/realtime/ScreenService.java
+          grep -q 'lowConfidenceFrames == 1) overlay.clear()' app/src/main/java/id/chesslens/realtime/ScreenService.java
+          python tools/test_v10_features.py
+          mkdir -p "$RUNNER_TEMP/arrow-geometry-test"
+          javac -d "$RUNNER_TEMP/arrow-geometry-test" \
+            app/src/main/java/id/chesslens/realtime/overlay/ArrowGeometry.java \
+            tools/arrow-geometry-test/TestArrowGeometry.java
+          java -cp "$RUNNER_TEMP/arrow-geometry-test" TestArrowGeometry
+          python -m py_compile tools/convert_chess_cv_model.py tools/test_v093_features.py
+          python tools/test_fen_mapping.py
+          python tools/test_learning_pv.py
+          python tools/test_v093_features.py
+          python tools/test_v094_features.py
+
+      - name: Set up Python for model conversion
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned model conversion tools
+        run: python -m pip install --disable-pip-version-check torch==2.7.1 safetensors==0.6.2 onnx==1.18.0 onnxruntime==1.22.1 numpy==2.2.6
+
+      - name: Download MIT chess-square classifier weights
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/chesslens-model" app/src/main/assets/models
+          curl --fail --location --retry 5 --retry-all-errors \
+            'https://huggingface.co/S1M0N38/chess-cv/resolve/main/pieces.safetensors' \
+            -o "$RUNNER_TEMP/chesslens-model/pieces.safetensors"
+          test "$(stat -c%s "$RUNNER_TEMP/chesslens-model/pieces.safetensors")" -gt 500000
+
+      - name: Convert model to ONNX and verify inference
+        run: |
+          python tools/convert_chess_cv_model.py \
+            --weights "$RUNNER_TEMP/chesslens-model/pieces.safetensors" \
+            --output app/src/main/assets/models/chess-pieces.onnx
+          test -s app/src/main/assets/models/chess-pieces.onnx
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Smoke-test UCI parser and early PV with fake Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/uci-smoke"
+          javac -d "$RUNNER_TEMP/uci-smoke" \
+            tools/uci-smoke/id/chesslens/realtime/engine/WasmEngineHost.java \
+            app/src/main/java/id/chesslens/realtime/engine/UciEngine.java \
+            tools/uci-smoke/TestUciEngine.java
+          java -cp "$RUNNER_TEMP/uci-smoke" TestUciEngine
+
+      - name: Install Android API and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print | sort -V | tail -n 1)"
+          test -x "$sdkmanager_path"
+          set +o pipefail
+          yes | "$sdkmanager_path" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager_path" 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Download pinned Stockfish 18 WASM assets and patch SHA-256 values
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache="$HOME/.cache/chesslens-stockfish-18.0.5"
+          mkdir -p "$cache" "$RUNNER_TEMP/stockfish-package"
+          js="$cache/stockfish-18-single.js"
+          wasm="$cache/stockfish-18-single.wasm"
+          if [[ ! -s "$js" || $(stat -c%s "$js") -lt 10000 || ! -s "$wasm" || $(stat -c%s "$wasm") -lt 100000000 ]]; then
+            pack_name="$(npm pack stockfish@18.0.5 --silent --pack-destination "$RUNNER_TEMP/stockfish-package")"
+            test -n "$pack_name"
+            tar -xzf "$RUNNER_TEMP/stockfish-package/$pack_name" -C "$RUNNER_TEMP/stockfish-package"
+            cp "$RUNNER_TEMP/stockfish-package/package/bin/stockfish-18-single.js" "$js"
+            cp "$RUNNER_TEMP/stockfish-package/package/bin/stockfish-18-single.wasm" "$wasm"
+          fi
+          js_sha="$(sha256sum "$js" | awk '{print $1}')"
+          wasm_sha="$(sha256sum "$wasm" | awk '{print $1}')"
+          engine_java="app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java"
+          sed -i "s/__STOCKFISH_JS_SHA256__/$js_sha/g" "$engine_java"
+          sed -i "s/__STOCKFISH_WASM_SHA256__/$wasm_sha/g" "$engine_java"
+          ! grep -q '__STOCKFISH_.*_SHA256__' "$engine_java"
+          grep -q 'stockfish-18-single.wasm' "$engine_java"
+          grep -q 'stockfish-18-single.wasm' app/src/main/java/id/chesslens/realtime/engine/WasmEngineHost.java
+          echo "Stockfish JS SHA-256: $js_sha"
+          echo "Stockfish WASM SHA-256: $wasm_sha"
+
+      - name: Run Android/ChessLib unit tests
+        run: gradle --no-daemon --stacktrace testDebugUnitTest
+
+      - name: Build ARM64 debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK, ABI, model, and on-demand Stockfish
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk"
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+          unzip -Z1 "$apk" | grep -q 'assets/models/chess-pieces.onnx'
+          unzip -Z1 "$apk" | grep -q '^lib/arm64-v8a/libonnxruntime.so$'
+          if unzip -Z1 "$apk" | grep '^lib/' | grep -v '^lib/arm64-v8a/'; then
+            echo 'The v1.0 APK must contain ARM64 libraries only.'
+            exit 1
+          fi
+          if unzip -Z1 "$apk" | grep -Eiq 'stockfish.*\.(wasm|js)$|libstockfish'; then
+            echo 'Stockfish must remain an in-app download, not bundled in the installer.'
+            exit 1
+          fi
+          cp "$apk" ChessLens-Realtime-v1.0-arm64-debug.apk
+          echo "APK size: $(du -h "$apk" | cut -f1)"
+          "${ANDROID_HOME}/build-tools/34.0.0/aapt" dump badging "$apk" | grep -E "versionName='0.9.4'"
+
+      - name: Upload v1.0 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessLens-Realtime-v1.0-ARM64-APK
+          path: ChessLens-Realtime-v1.0-arm64-debug.apk
+          retention-days: 30
