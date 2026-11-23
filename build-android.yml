@@ -1,0 +1,90 @@
+name: Build ChessLens APK (Stockfish 18)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout app source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API and build tools
+        run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Obtain official Stockfish 18 Android executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Hash values are for the extracted executable, not for the tar archive.
+          while IFS=' ' read -r suffix abi expected; do
+            test -n "$suffix" || continue
+            archive="stockfish-android-${suffix}.tar"
+            url="https://github.com/official-stockfish/Stockfish/releases/download/sf_18/${archive}"
+            echo "Fetching ${url}"
+            curl --fail --location --retry 4 --retry-delay 3 --output "$archive" "$url"
+            mkdir -p "stockfish-extract/${suffix}"
+            tar -xf "$archive" -C "stockfish-extract/${suffix}"
+            binary="$(find "stockfish-extract/${suffix}" -type f -name "stockfish-android-${suffix}" -print -quit)"
+            test -s "$binary" || { echo "Engine executable missing for ${suffix}"; exit 1; }
+            echo "${expected}  ${binary}" | sha256sum --check --status
+            mkdir -p "app/src/main/jniLibs/${abi}"
+            cp "$binary" "app/src/main/jniLibs/${abi}/libstockfish.so"
+          done <<'ENGINES'
+          armv8 arm64-v8a cc3b3b74466b6d85cdc0f8cfdad4111c6a44bd0698f4eab96fea7b359a54d3d4
+          armv7-neon armeabi-v7a 672fbd7533d15fc70dae82df52c1185236975d059a585aa65eda960f1a3266ea
+          ENGINES
+
+      - name: Compile debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK signature and packaged engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+          unzip -Z1 "$apk" | grep -q '^lib/arm64-v8a/libstockfish\.so$'
+          unzip -Z1 "$apk" | grep -q '^lib/armeabi-v7a/libstockfish\.so$'
+          cp "$apk" ChessLens-Realtime-debug.apk
+
+      - name: Attach APK to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessLens-Realtime-APK
+          path: ChessLens-Realtime-debug.apk
+          retention-days: 30
+
+      - name: Publish direct APK in GitHub Releases (manual build only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="chesslens-v0.2-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" ChessLens-Realtime-debug.apk \
+            --title "ChessLens Realtime APK — build ${GITHUB_RUN_NUMBER}" \
+            --notes "Debug APK for personal testing. Android 8+, arm64 and armeabi-v7a. This build has not been tested on a physical device. Source is available in this repository; Stockfish 18 is GPLv3."
