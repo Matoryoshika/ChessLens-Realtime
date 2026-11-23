@@ -1,0 +1,120 @@
+name: Build ChessLens Realtime v0.4 (Stockfish 18 WASM)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unpack v0.4 source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="ChessLens-Realtime-v0.4-WASM-Engine.zip"
+          if [[ -f "$archive" ]]; then
+            unzip -oq "$archive" -d .
+          fi
+          test -f settings.gradle
+          test -f build.gradle
+          test -f app/build.gradle
+          test -f app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java
+          test -f app/src/main/java/id/chesslens/realtime/engine/WasmEngineHost.java
+          test -f app/src/main/java/id/chesslens/realtime/engine/UciEngine.java
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android API and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print | sort -V | tail -n 1)"
+          test -x "$sdkmanager_path"
+          set +o pipefail
+          yes | "$sdkmanager_path" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager_path" 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Cache pinned Stockfish 18 WebAssembly assets
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/chesslens-stockfish-18.0.5
+          key: chesslens-stockfish-18.0.5-full-single-wasm-v1
+
+      - name: Pin SHA-256 for Stockfish 18 full WASM downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache="$HOME/.cache/chesslens-stockfish-18.0.5"
+          mkdir -p "$cache"
+          js="$cache/stockfish-18-single.js"
+          wasm="$cache/stockfish-18-single.wasm"
+          base="https://cdn.jsdelivr.net/npm/stockfish@18.0.5/bin"
+          if [[ ! -s "$js" || $(stat -c%s "$js") -lt 10000 ]]; then
+            rm -f "$js"
+            curl --fail --location --retry 3 --retry-delay 2 "$base/stockfish-18-single.js" -o "$js"
+          fi
+          if [[ ! -s "$wasm" || $(stat -c%s "$wasm") -lt 100000000 ]]; then
+            rm -f "$wasm"
+            curl --fail --location --retry 3 --retry-delay 2 "$base/stockfish-18-single.wasm" -o "$wasm"
+          fi
+          js_sha="$(sha256sum "$js" | awk '{print $1}')"
+          wasm_sha="$(sha256sum "$wasm" | awk '{print $1}')"
+          sed -i "s/__STOCKFISH_JS_SHA256__/$js_sha/g" app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java
+          sed -i "s/__STOCKFISH_WASM_SHA256__/$wasm_sha/g" app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java
+          ! grep -q '__STOCKFISH_.*_SHA256__' app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java
+          echo "Stockfish 18 JS SHA-256: $js_sha"
+          echo "Stockfish 18 WASM SHA-256: $wasm_sha"
+
+      - name: Compile small installer APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK signature and ensure engine is downloaded after install
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+          if unzip -Z1 "$apk" | grep -Eiq 'stockfish.*\.(wasm|js)$|libstockfish'; then
+            echo "Stockfish engine must remain an in-app WASM download, not bundled in the installer APK."
+            exit 1
+          fi
+          cp "$apk" ChessLens-Realtime-v0.4-debug.apk
+          echo "APK size: $(du -h "$apk" | cut -f1)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessLens-Realtime-v0.4-APK
+          path: ChessLens-Realtime-v0.4-debug.apk
+          retention-days: 30
+
+      - name: Publish direct APK in GitHub Releases (manual build only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="chesslens-v0.4-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" ChessLens-Realtime-v0.4-debug.apk \
+            --title "ChessLens Realtime v0.4 — Stockfish 18 WASM" \
+            --notes "Small installer APK. The full single-threaded Stockfish 18 WASM engine (about 113 MB) downloads inside the app, runs in WebView, and supports cancellation. Runtime behavior still requires physical-device testing."
