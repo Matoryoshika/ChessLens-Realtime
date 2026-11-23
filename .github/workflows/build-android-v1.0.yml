@@ -180,7 +180,7 @@ jobs:
           fi
           cp "$apk" ChessLens-Realtime-v1.0-arm64-debug.apk
           echo "APK size: $(du -h "$apk" | cut -f1)"
-          "${ANDROID_HOME}/build-tools/34.0.0/aapt" dump badging "$apk" | grep -E "versionName='0.9.4'"
+          "${ANDROID_HOME}/build-tools/34.0.0/aapt" dump badging "$apk" | grep -E "versionName='1.0'"
 
       - name: Upload v1.0 APK artifact
         uses: actions/upload-artifact@v4
