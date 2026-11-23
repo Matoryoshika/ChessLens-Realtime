@@ -1,0 +1,92 @@
+name: Build ChessLens Realtime (On-Demand Stockfish 18)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unpack full project archive when uploaded
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="ChessLens-Realtime-v0.3-OnDemand-Engine.zip"
+          if [[ -f "$archive" ]]; then
+            unzip -oq "$archive" -d .
+          fi
+          test -f settings.gradle
+          test -f build.gradle
+          test -d app/src/main
+          test -f app/build.gradle
+          test -f app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android API and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print | sort -V | tail -n 1)"
+          test -x "$sdkmanager_path"
+          # The runner may already have licenses accepted. Temporarily disable
+          # pipefail because `yes` can receive SIGPIPE after sdkmanager exits.
+          set +o pipefail
+          yes | "$sdkmanager_path" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager_path" 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile small installer APK (Stockfish is downloaded in-app)
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK signature and ensure Stockfish is not bundled
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+          if unzip -Z1 "$apk" | grep -q '^lib/.*/libstockfish'; then
+            echo "Stockfish should be downloaded after installation, not bundled in the APK."
+            exit 1
+          fi
+          cp "$apk" ChessLens-Realtime-v0.3-debug.apk
+          echo "APK size: $(du -h "$apk" | cut -f1)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessLens-Realtime-v0.3-APK
+          path: ChessLens-Realtime-v0.3-debug.apk
+          retention-days: 30
+
+      - name: Publish direct APK in GitHub Releases (manual build only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="chesslens-v0.3-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" ChessLens-Realtime-v0.3-debug.apk \
+            --title "ChessLens Realtime v0.3 — On-Demand Stockfish" \
+            --notes "Small installer APK. Stockfish 18 is downloaded inside the app on first launch, selected by device ABI, SHA-256 verified, and smoke-tested before use. ARM64 and ARMv7 supported. Screen-capture permission is requested per session by Android."
