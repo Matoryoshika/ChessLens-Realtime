@@ -1,0 +1,918 @@
+name: Build ChessLens Realtime v0.8 - Performance Optimization
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-android-v0.8-performance.yml'
+      - 'ChessLens-Realtime-v0.7-Universal-Position-Learning-Mode.zip'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Patch v0.7 source into v0.8
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/apply_v08.py" <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          import textwrap
+
+          source_zip = Path("ChessLens-Realtime-v0.7-Universal-Position-Learning-Mode.zip")
+          output_zip = Path("ChessLens-Realtime-v0.8-Performance-Optimization.zip")
+          if not source_zip.is_file():
+              raise SystemExit(f"Source archive not found: {source_zip}")
+
+          with ZipFile(source_zip, "r") as archive:
+              entries = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+              infos = {info.filename: info for info in archive.infolist()}
+
+          def read_text(path):
+              if path not in entries:
+                  raise SystemExit(f"Required source file missing: {path}")
+              return entries[path].decode("utf-8")
+
+          def write_text(path, value):
+              entries[path] = value.encode("utf-8")
+
+          def replace_once(value, old, new, label):
+              count = value.count(old)
+              if count != 1:
+                  raise SystemExit(f"Patch anchor mismatch for {label}: expected 1, found {count}")
+              return value.replace(old, new, 1)
+
+          def replace_method(value, start_marker, end_marker, replacement, label):
+              start = value.find(start_marker)
+              if start < 0:
+                  raise SystemExit(f"Start marker not found: {label}")
+              end = value.find(end_marker, start)
+              if end < 0:
+                  raise SystemExit(f"End marker not found: {label}")
+              return value[:start] + textwrap.dedent(replacement) + value[end:]
+
+          # 1) Reduce the expensive whole-screen board search.
+          path = "app/src/main/java/id/chesslens/realtime/vision/BoardFinder.java"
+          src = read_text(path)
+          src = replace_once(src, "private static final int LIMIT = 440;", "private static final int LIMIT = 360;", "board finder downscale")
+          src = replace_once(src, "int sizeStep = Math.max(4, (maxSize - minSize) / 26);",
+                                  "int sizeStep = Math.max(7, (maxSize - minSize) / 20);", "coarse size step")
+          src = replace_once(src, "int step = Math.max(5, size / 32);",
+                                  "int step = Math.max(6, size / 26);", "coarse scan step")
+          src = replace_once(src, "int minFineSize = Math.max(minSize, best.size - Math.max(12, sizeStep));",
+                                  "int minFineSize = Math.max(minSize, best.size - Math.max(10, sizeStep));", "fine minimum")
+          src = replace_once(src, "int maxFineSize = Math.min(maxSize, best.size + Math.max(12, sizeStep));",
+                                  "int maxFineSize = Math.min(maxSize, best.size + Math.max(10, sizeStep));", "fine maximum")
+          src = replace_once(src, "for (int size = minFineSize; size <= maxFineSize; size += 2) {",
+                                  "for (int size = minFineSize; size <= maxFineSize; size += 3) {", "fine size increment")
+          src = replace_once(src, "int y0 = Math.max(0, best.y - 18), y1 = Math.min(h - size, best.y + 18);",
+                                  "int y0 = Math.max(0, best.y - 12), y1 = Math.min(h - size, best.y + 12);", "fine y window")
+          src = replace_once(src, "int x0 = Math.max(0, best.x - 18), x1 = Math.min(w - size, best.x + 18);",
+                                  "int x0 = Math.max(0, best.x - 12), x1 = Math.min(w - size, best.x + 12);", "fine x window")
+          src = replace_once(src, "for (int y = y0; y <= y1; y += 2) {",
+                                  "for (int y = y0; y <= y1; y += 3) {", "fine y step")
+          src = replace_once(src, "for (int x = x0; x <= x1; x += 2) {",
+                                  "for (int x = x0; x <= x1; x += 3) {", "fine x step")
+          write_text(path, src)
+
+          # 2) Reuse classifier buffers and avoid repeating the two-orientation
+          #    probe on every low-confidence frame.
+          path = "app/src/main/java/id/chesslens/realtime/vision/PieceClassifier.java"
+          src = read_text(path)
+          src = replace_once(src, "private Result lastResult;",
+                                  "private Result lastResult;\n    private final float[] inputBuffer = new float[SQUARES * 3 * PIXELS];\n    private final ByteBuffer tensorBytes = ByteBuffer.allocateDirect(SQUARES * 3 * PIXELS * Float.BYTES).order(ByteOrder.nativeOrder());\n    private final FloatBuffer tensorBuffer = tensorBytes.asFloatBuffer();\n    private int[] boardPixelBuffer = new int[0];",
+                                  "reusable classifier buffers")
+          src = replace_once(src,
+              "float[] input = new float[SQUARES * 3 * PIXELS];\n        float cellWidth = board.width() / 8f;",
+              "int boardArea = board.width() * board.height();\n        if (boardPixelBuffer.length < boardArea) boardPixelBuffer = new int[boardArea];\n        frame.getPixels(boardPixelBuffer, 0, board.width(), board.left, board.top, board.width(), board.height());\n        float[] input = inputBuffer;\n        float cellWidth = board.width() / 8f;",
+              "classifier pixel crop")
+          src = replace_once(src, "int color = frame.getPixel(sourceX, sourceY);",
+                                  "int color = boardPixelBuffer[(sourceY - board.top) * board.width() + (sourceX - board.left)];",
+                                  "bulk pixel access")
+          src = replace_once(src,
+              "FloatBuffer tensorBuffer = ByteBuffer.allocateDirect(input.length * Float.BYTES)\n                .order(ByteOrder.nativeOrder()).asFloatBuffer();\n        tensorBuffer.put(input);\n        tensorBuffer.rewind();",
+              "tensorBuffer.clear();\n        tensorBuffer.put(input);\n        tensorBuffer.rewind();",
+              "reusable ONNX tensor buffer")
+          write_text(path, src)
+
+          # 3) Correct arrow coordinates when capture and overlay dimensions differ.
+          path = "app/src/main/java/id/chesslens/realtime/overlay/ArrowCanvas.java"
+          arrow_canvas = r'''package id.chesslens.realtime.overlay;
+
+          import android.content.Context;
+          import android.graphics.*;
+          import android.view.View;
+
+          /** Draws played-move, own-best, and predicted-opponent arrows over the captured board. */
+          public final class ArrowCanvas extends View {
+              private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private Rect sourceBoardRect;
+              private Rect drawBoardRect;
+              private int sourceWidth;
+              private int sourceHeight;
+              private String playedFrom = "", playedTo = "", myFrom = "", myTo = "";
+              private String opponentFrom = "", opponentTo = "", symbol = "";
+              private boolean whiteBottom = true;
+
+              public ArrowCanvas(Context context) {
+                  super(context);
+              }
+
+              public void update(Rect rect, int frameWidth, int frameHeight,
+                                 String from, String to, String mark,
+                                 String myMove, String opponentMove, boolean white) {
+                  sourceBoardRect = rect == null ? null : new Rect(rect);
+                  sourceWidth = frameWidth;
+                  sourceHeight = frameHeight;
+                  playedFrom = from == null ? "" : from;
+                  playedTo = to == null ? "" : to;
+                  symbol = mark == null ? "" : mark;
+                  myFrom = square(myMove, 0);
+                  myTo = square(myMove, 2);
+                  opponentFrom = square(opponentMove, 0);
+                  opponentTo = square(opponentMove, 2);
+                  whiteBottom = white;
+                  invalidate();
+              }
+
+              private String square(String move, int offset) {
+                  if (move == null || !move.matches("[a-h][1-8][a-h][1-8][qrbn]?")) return "";
+                  return move.substring(offset, offset + 2);
+              }
+
+              @Override protected void onDraw(Canvas canvas) {
+                  super.onDraw(canvas);
+                  if (sourceBoardRect == null || getWidth() <= 0 || getHeight() <= 0) return;
+
+                  float sx = sourceWidth > 0 ? (float) getWidth() / sourceWidth : 1f;
+                  float sy = sourceHeight > 0 ? (float) getHeight() / sourceHeight : 1f;
+                  drawBoardRect = new Rect(
+                          Math.round(sourceBoardRect.left * sx),
+                          Math.round(sourceBoardRect.top * sy),
+                          Math.round(sourceBoardRect.right * sx),
+                          Math.round(sourceBoardRect.bottom * sy));
+                  if (drawBoardRect.width() < 8 || drawBoardRect.height() < 8) return;
+
+                  if (!playedFrom.isEmpty() && !playedTo.isEmpty()) {
+                      int color = ("??".equals(symbol) || "?".equals(symbol)) ? 0xffed5965
+                              : ("?!".equals(symbol) || "!?".equals(symbol)) ? 0xffe7a23a
+                              : 0xff32c886;
+                      arrow(canvas, playedFrom, playedTo, color, false);
+                      if (!symbol.isEmpty() && !"…".equals(symbol)) badge(canvas, playedTo, symbol, color);
+                  }
+                  if (!opponentFrom.isEmpty() && !opponentTo.isEmpty()) {
+                      arrow(canvas, opponentFrom, opponentTo, 0xffffa126, true);
+                      badge(canvas, opponentTo, "L", 0xffd97706);
+                  }
+                  if (!myFrom.isEmpty() && !myTo.isEmpty()) {
+                      arrow(canvas, myFrom, myTo, 0xff22c55e, false);
+                      badge(canvas, myTo, "S", 0xff15803d);
+                  }
+              }
+
+              private void arrow(Canvas canvas, String from, String to, int color, boolean dashed) {
+                  PointF start = center(from);
+                  PointF finish = center(to);
+                  float boardUnit = Math.min(drawBoardRect.width(), drawBoardRect.height());
+                  float width = Math.max(4f, boardUnit / 82f);
+                  double angle = Math.atan2(finish.y - start.y, finish.x - start.x);
+                  float trim = Math.max(width * 1.35f, boardUnit / 46f);
+                  PointF lineEnd = new PointF(
+                          finish.x - (float) Math.cos(angle) * trim,
+                          finish.y - (float) Math.sin(angle) * trim);
+
+                  paint.reset();
+                  paint.setAntiAlias(true);
+                  paint.setColor(color);
+                  paint.setStrokeWidth(width);
+                  paint.setStrokeCap(Paint.Cap.ROUND);
+                  paint.setStyle(Paint.Style.STROKE);
+                  if (dashed) paint.setPathEffect(new DashPathEffect(new float[]{width * 2f, width * 1.4f}, 0));
+                  canvas.drawLine(start.x, start.y, lineEnd.x, lineEnd.y, paint);
+                  paint.setPathEffect(null);
+
+                  float head = width * 2.8f;
+                  Path tip = new Path();
+                  tip.moveTo(finish.x, finish.y);
+                  tip.lineTo(finish.x - (float) Math.cos(angle - 0.51) * head,
+                          finish.y - (float) Math.sin(angle - 0.51) * head);
+                  tip.lineTo(finish.x - (float) Math.cos(angle + 0.51) * head,
+                          finish.y - (float) Math.sin(angle + 0.51) * head);
+                  tip.close();
+                  paint.setStyle(Paint.Style.FILL);
+                  canvas.drawPath(tip, paint);
+              }
+
+              private void badge(Canvas canvas, String square, String mark, int background) {
+                  PointF destination = center(square);
+                  float tileWidth = drawBoardRect.width() / 8f;
+                  float tileHeight = drawBoardRect.height() / 8f;
+                  float radius = Math.max(10f, Math.min(tileWidth, tileHeight) * 0.19f);
+                  float bx = destination.x + tileWidth * 0.29f;
+                  float by = destination.y - tileHeight * 0.28f;
+
+                  paint.reset();
+                  paint.setAntiAlias(true);
+                  paint.setColor(background);
+                  paint.setStyle(Paint.Style.FILL);
+                  canvas.drawCircle(bx, by, radius, paint);
+                  paint.setColor(Color.WHITE);
+                  paint.setTextSize(radius * 0.98f);
+                  paint.setTextAlign(Paint.Align.CENTER);
+                  paint.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+                  canvas.drawText(mark, bx, by + radius * 0.34f, paint);
+              }
+
+              private PointF center(String square) {
+                  int file = square.charAt(0) - 'a';
+                  int row = 8 - (square.charAt(1) - '0');
+                  if (!whiteBottom) {
+                      file = 7 - file;
+                      row = 7 - row;
+                  }
+                  float cellWidth = drawBoardRect.width() / 8f;
+                  float cellHeight = drawBoardRect.height() / 8f;
+                  return new PointF(
+                          drawBoardRect.left + (file + 0.5f) * cellWidth,
+                          drawBoardRect.top + (row + 0.5f) * cellHeight);
+              }
+          }
+          '''
+          write_text(path, textwrap.dedent(arrow_canvas))
+
+          # 4) Smaller HUD with a real minimize/restore handle.
+          path = "app/src/main/java/id/chesslens/realtime/overlay/FloatingOverlay.java"
+          floating_overlay = r'''package id.chesslens.realtime.overlay;
+
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.graphics.drawable.GradientDrawable;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          /** Compact, draggable HUD with a separate restore handle when minimized. */
+          public final class FloatingOverlay {
+              private final WindowManager windowManager;
+              private final ArrowCanvas arrows;
+              private final LinearLayout panel;
+              private final TextView status;
+              private final Button pauseButton;
+              private final Button orientationButton;
+              private final Button turnButton;
+              private final Button myBestButton;
+              private final Button opponentBestButton;
+              private final Button playerSideButton;
+              private final WindowManager.LayoutParams params;
+              private final TextView miniHandle;
+              private final WindowManager.LayoutParams miniParams;
+              private boolean minimized = false;
+              private float touchX, touchY;
+              private int beginX, beginY;
+
+              public FloatingOverlay(Context context, Runnable relockBoard, Runnable togglePause,
+                                     Runnable flipOrientation, Runnable toggleTurn, Runnable toggleMyBest,
+                                     Runnable toggleOpponentBest, Runnable togglePlayerSide, Runnable stop) {
+                  windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+                  arrows = new ArrowCanvas(context);
+                  WindowManager.LayoutParams canvasParams = new WindowManager.LayoutParams(
+                          -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                          PixelFormat.TRANSLUCENT);
+                  canvasParams.gravity = Gravity.TOP | Gravity.LEFT;
+                  windowManager.addView(arrows, canvasParams);
+
+                  panel = new LinearLayout(context);
+                  panel.setOrientation(LinearLayout.VERTICAL);
+                  panel.setPadding(dp(context, 8), dp(context, 7), dp(context, 8), dp(context, 7));
+                  GradientDrawable backdrop = new GradientDrawable();
+                  backdrop.setColor(0xee111a2c);
+                  backdrop.setCornerRadius(dp(context, 14));
+                  panel.setBackground(backdrop);
+                  panel.setElevation(dp(context, 5));
+
+                  status = new TextView(context);
+                  status.setText("♟ ChessLens: mencari papan…");
+                  status.setTextSize(11);
+                  status.setTextColor(Color.WHITE);
+                  status.setMaxLines(6);
+                  status.setMinWidth(0);
+                  panel.addView(status);
+
+                  TextView hint = new TextView(context);
+                  hint.setText("Hijau: kamu · Oranye putus: lawan");
+                  hint.setTextSize(9);
+                  hint.setTextColor(0xffb7c5d9);
+                  hint.setMaxLines(1);
+                  panel.addView(hint);
+
+                  LinearLayout firstRow = row(context);
+                  Button relock = button(context, "Kunci", relockBoard);
+                  addWeighted(context, firstRow, relock);
+                  orientationButton = button(context, "Putih↓", flipOrientation);
+                  addWeighted(context, firstRow, orientationButton);
+                  turnButton = button(context, "Giliran P", toggleTurn);
+                  addWeighted(context, firstRow, turnButton);
+                  panel.addView(firstRow);
+
+                  LinearLayout secondRow = row(context);
+                  pauseButton = button(context, "Jeda", togglePause);
+                  addWeighted(context, secondRow, pauseButton);
+                  Button hide = button(context, "Sembunyi", this::hidePanel);
+                  addWeighted(context, secondRow, hide);
+                  Button close = button(context, "Stop", stop);
+                  addWeighted(context, secondRow, close);
+                  panel.addView(secondRow);
+
+                  LinearLayout learningRow = row(context);
+                  myBestButton = button(context, "Saya ON", toggleMyBest);
+                  opponentBestButton = button(context, "Lawan ON", toggleOpponentBest);
+                  playerSideButton = button(context, "Saya P", togglePlayerSide);
+                  addWeighted(context, learningRow, myBestButton);
+                  addWeighted(context, learningRow, opponentBestButton);
+                  addWeighted(context, learningRow, playerSideButton);
+                  panel.addView(learningRow);
+
+                  params = new WindowManager.LayoutParams(
+                          dp(context, 232), WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT);
+                  params.gravity = Gravity.TOP | Gravity.LEFT;
+                  params.x = dp(context, 8);
+                  params.y = dp(context, 72);
+                  windowManager.addView(panel, params);
+
+                  miniHandle = new TextView(context);
+                  miniHandle.setText("♟");
+                  miniHandle.setTextSize(21);
+                  miniHandle.setTextColor(Color.WHITE);
+                  miniHandle.setGravity(Gravity.CENTER);
+                  GradientDrawable miniBackground = new GradientDrawable();
+                  miniBackground.setColor(0xee111a2c);
+                  miniBackground.setCornerRadius(dp(context, 24));
+                  miniBackground.setStroke(dp(context, 1), 0xff38bdf8);
+                  miniHandle.setBackground(miniBackground);
+                  miniHandle.setElevation(dp(context, 5));
+                  miniHandle.setOnClickListener(view -> showPanel());
+                  miniParams = new WindowManager.LayoutParams(
+                          dp(context, 48), dp(context, 48),
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT);
+                  miniParams.gravity = Gravity.TOP | Gravity.LEFT;
+                  miniParams.x = params.x;
+                  miniParams.y = params.y;
+
+                  status.setOnTouchListener((View view, MotionEvent event) -> {
+                      if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                          touchX = event.getRawX();
+                          touchY = event.getRawY();
+                          beginX = params.x;
+                          beginY = params.y;
+                          return true;
+                      }
+                      if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                          params.x = beginX + (int) (event.getRawX() - touchX);
+                          params.y = beginY + (int) (event.getRawY() - touchY);
+                          windowManager.updateViewLayout(panel, params);
+                          return true;
+                      }
+                      return true;
+                  });
+              }
+
+              private static LinearLayout row(Context context) {
+                  LinearLayout row = new LinearLayout(context);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  return row;
+              }
+
+              private static void addWeighted(Context context, LinearLayout row, Button button) {
+                  LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(
+                          0, dp(context, 32), 1f);
+                  layout.setMargins(dp(context, 1), dp(context, 1), dp(context, 1), dp(context, 1));
+                  row.addView(button, layout);
+              }
+
+              private static Button button(Context context, String label, Runnable action) {
+                  Button button = new Button(context);
+                  button.setText(label);
+                  button.setTextSize(9);
+                  button.setTextColor(Color.WHITE);
+                  button.setAllCaps(false);
+                  button.setMinWidth(0);
+                  button.setMinimumWidth(0);
+                  button.setMinHeight(0);
+                  button.setMinimumHeight(0);
+                  button.setPadding(dp(context, 2), 0, dp(context, 2), 0);
+                  GradientDrawable background = new GradientDrawable();
+                  background.setColor(0xff263449);
+                  background.setCornerRadius(dp(context, 7));
+                  button.setBackground(background);
+                  button.setOnClickListener(view -> action.run());
+                  return button;
+              }
+
+              private void hidePanel() {
+                  if (minimized) return;
+                  panel.setVisibility(View.GONE);
+                  miniParams.x = params.x;
+                  miniParams.y = params.y;
+                  windowManager.addView(miniHandle, miniParams);
+                  minimized = true;
+              }
+
+              private void showPanel() {
+                  if (!minimized) return;
+                  try { windowManager.removeView(miniHandle); } catch (Exception ignored) { }
+                  panel.setVisibility(View.VISIBLE);
+                  windowManager.updateViewLayout(panel, params);
+                  minimized = false;
+              }
+
+              private static int dp(Context context, int value) {
+                  return (int) (value * context.getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              public void status(String message) {
+                  if (status != null) status.post(() -> status.setText(message));
+              }
+
+              public void setPaused(boolean paused) {
+                  pauseButton.post(() -> pauseButton.setText(paused ? "Lanjut" : "Jeda"));
+              }
+
+              public void setOrientation(boolean whiteBottom, boolean manual) {
+                  String label = whiteBottom ? "Putih↓" : "Hitam↓";
+                  orientationButton.post(() -> orientationButton.setText(label + (manual ? " *" : "")));
+              }
+
+              public void setTurn(boolean whiteToMove) {
+                  turnButton.post(() -> turnButton.setText("Giliran " + (whiteToMove ? "P" : "H")));
+              }
+
+              public void setLearningOptions(boolean myBest, boolean opponentBest, boolean playerWhite) {
+                  myBestButton.post(() -> myBestButton.setText("Saya " + (myBest ? "ON" : "OFF")));
+                  opponentBestButton.post(() -> opponentBestButton.setText("Lawan " + (opponentBest ? "ON" : "OFF")));
+                  playerSideButton.post(() -> playerSideButton.setText("Saya " + (playerWhite ? "P" : "H")));
+              }
+
+              public void annotate(Rect rect, int frameWidth, int frameHeight,
+                                   String from, String to, String symbol,
+                                   String myBestMove, String opponentBestMove, boolean whiteBottom) {
+                  arrows.post(() -> arrows.update(rect, frameWidth, frameHeight, from, to, symbol,
+                          myBestMove, opponentBestMove, whiteBottom));
+              }
+
+              public void clear() {
+                  arrows.post(() -> arrows.update(null, 0, 0, "", "", "", "", "", true));
+              }
+
+              public void dispose() {
+                  try { windowManager.removeView(arrows); } catch (Exception ignored) { }
+                  if (minimized) {
+                      try { windowManager.removeView(miniHandle); } catch (Exception ignored) { }
+                  }
+                  try { windowManager.removeView(panel); } catch (Exception ignored) { }
+              }
+          }
+          '''
+          write_text(path, textwrap.dedent(floating_overlay))
+
+          # 5) Keep the camera/recognition loop responsive while Stockfish works
+          #    on its own serial executor. New positions invalidate old results.
+          path = "app/src/main/java/id/chesslens/realtime/ScreenService.java"
+          src = read_text(path)
+          src = replace_once(src, "import java.util.concurrent.atomic.AtomicBoolean;",
+                                  "import java.util.concurrent.atomic.AtomicBoolean;\nimport java.util.concurrent.atomic.AtomicLong;",
+                                  "analysis generation import")
+          src = replace_once(src, "private final ExecutorService worker = Executors.newSingleThreadExecutor();",
+                                  "private final ExecutorService worker = Executors.newSingleThreadExecutor();\n    private final ExecutorService analysisWorker = Executors.newSingleThreadExecutor();\n    private final AtomicLong analysisGeneration = new AtomicLong(0);",
+                                  "separate analysis executor")
+          src = replace_once(src, "private UciEngine engine;", "private volatile UciEngine engine;", "volatile engine")
+          src = replace_once(src, "private volatile Rect lastAnalyzedBoard;",
+                                  "private volatile Rect lastAnalyzedBoard;\n    private volatile int lastAnalyzedFrameWidth = 0;\n    private volatile int lastAnalyzedFrameHeight = 0;",
+                                  "analysis frame dimensions")
+          src = replace_once(src, "private int width, height, thinkMs = 700;",
+                                  "private int width, height, thinkMs = 350;",
+                                  "shorter default engine think time")
+          src = replace_once(src, "private String lastAnalyzedFen = \"\";",
+                                  "private volatile String lastAnalyzedFen = \"\";\n    private long lastFullBoardScanAt = 0;\n    private long lastRecognitionStatusAt = 0;\n    private int lowConfidenceFrames = 0;",
+                                  "board scan and recognition state")
+          src = replace_once(src, "thinkMs = Math.max(200, Math.min(3000, intent.getIntExtra(\"thinkMs\", 700)));",
+                                  "thinkMs = Math.max(150, Math.min(1500, intent.getIntExtra(\"thinkMs\", 350)));",
+                                  "engine think time clamp")
+          src = replace_once(src, "main.postDelayed(this, 1050);", "main.postDelayed(this, 500);", "capture cadence")
+          src = replace_once(src, "forceRelock = true;\n        candidateBoard = null;",
+                                  "forceRelock = true;\n        lastFullBoardScanAt = 0;\n        candidateBoard = null;",
+                                  "manual relock")
+          src = replace_once(src, "tracker.toggleOrientation();\n        if (classifier != null)",
+                                  "tracker.toggleOrientation();\n        analysisGeneration.incrementAndGet();\n        if (engine != null) engine.stopSearch();\n        lastEvaluation = null;\n        lastAnalyzedBoard = null;\n        if (classifier != null)",
+                                  "invalidate analysis on orientation change")
+          src = replace_once(src, "tracker.toggleSideToMove();\n        lastAnalyzedFen = \"\";",
+                                  "tracker.toggleSideToMove();\n        analysisGeneration.incrementAndGet();\n        if (engine != null) engine.stopSearch();\n        lastAnalyzedFen = \"\";",
+                                  "invalidate analysis on turn change")
+          src = replace_once(src,
+              "lastBoard = null; candidateBoard = null; candidateBoardCount = 0; boardMissCount = 0;",
+              "lastBoard = null; candidateBoard = null; candidateBoardCount = 0; boardMissCount = 0;\n        lastFullBoardScanAt = 0;\n        lowConfidenceFrames = 0;\n        analysisGeneration.incrementAndGet();\n        if (engine != null) engine.stopSearch();\n        lastEvaluation = null;\n        lastAnalyzedBoard = null;\n        lastAnalyzedFen = \"\";",
+              "reset board scan on resize")
+
+          new_process = r'''private void process(Bitmap frame) throws Exception {
+              long now = System.currentTimeMillis();
+              boolean shouldScan = forceRelock
+                      || (lastBoard == null && (lastFullBoardScanAt == 0 || now - lastFullBoardScanAt >= 1200))
+                      || (lastBoard != null && now - lastFullBoardScanAt >= 2500);
+              Rect detected = null;
+              if (shouldScan) {
+                  lastFullBoardScanAt = now;
+                  detected = finder.find(frame);
+                  if (detected == null && forceRelock) forceRelock = false;
+              } else if (candidateBoard != null) {
+                  detected = new Rect(candidateBoard);
+              } else if (lastBoard != null) {
+                  detected = new Rect(lastBoard);
+              }
+
+              if (detected == null && lastBoard != null) detected = new Rect(lastBoard);
+              if (detected == null) {
+                  if (now - lastRecognitionStatusAt > 1200) {
+                      lastRecognitionStatusAt = now;
+                      overlay.status("Mencari papan… pastikan seluruh papan terlihat.");
+                  }
+                  return;
+              }
+
+              Rect board = stabiliseBoard(detected);
+              if (board == null) return;
+              if (classifier == null) {
+                  overlay.status("Papan terkunci. Memuat model pengenal bidak…");
+                  classifier = new PieceClassifier(this);
+              }
+
+              PieceClassifier.Result result = classifier.classify(frame, board);
+              overlay.setOrientation(tracker.isWhiteBottom(), tracker.isManualOrientation());
+              overlay.setTurn(tracker.isWhiteToMove());
+
+              if (result.pieceCount < 2 || result.averageConfidence < 0.52f || result.lowConfidenceSquares > 12) {
+                  lowConfidenceFrames++;
+                  if (lowConfidenceFrames >= 8) {
+                      lastBoard = null;
+                      candidateBoard = null;
+                      candidateBoardCount = 0;
+                      lastFullBoardScanAt = 0;
+                      lowConfidenceFrames = 0;
+                  }
+                  if (now - lastRecognitionStatusAt > 1000) {
+                      lastRecognitionStatusAt = now;
+                      overlay.status("Papan terkunci · membaca bidak "
+                              + String.format(java.util.Locale.US, "%.0f%%", result.averageConfidence * 100)
+                              + " · kotak belum yakin " + result.lowConfidenceSquares);
+                  }
+                  return;
+              }
+              lowConfidenceFrames = 0;
+
+              PositionTracker.Update update = tracker.observe(result);
+              overlay.setOrientation(tracker.isWhiteBottom(), tracker.isManualOrientation());
+              overlay.setTurn(tracker.isWhiteToMove());
+              if (update != null) {
+                  handlePositionUpdate(update, board, result, frame.getWidth(), frame.getHeight());
+              }
+
+              String fen = tracker.getFen();
+              if (!fen.isEmpty() && !fen.equals(lastAnalyzedFen) && update == null) {
+                  analyzeCurrentPosition(fen, board, frame.getWidth(), frame.getHeight(),
+                          result, "Posisi stabil");
+              }
+          }
+
+          '''
+          src = replace_method(src, "private void process(Bitmap frame) throws Exception {",
+                                   "/** Keeps the board lock", new_process, "asynchronous recognition loop")
+
+          new_analysis_methods = r'''private void handlePositionUpdate(PositionTracker.Update update, Rect board,
+                                               PieceClassifier.Result recognition,
+                                               int frameWidth, int frameHeight) {
+              overlay.setTurn(tracker.isWhiteToMove());
+              String turn = tracker.isWhiteToMove() ? "Putih" : "Hitam";
+              if (update.move == null) {
+                  String prefix = update.initialPosition ? "Posisi papan berhasil dibaca" : "Posisi papan disinkronkan ulang";
+                  String suffix = update.resynchronised
+                          ? "\nGiliran mungkin perlu dikoreksi lewat tombol Giliran."
+                          : "\nGiliran awal diasumsikan Putih; koreksi jika perlu.";
+                  if (!tracker.isOrientationKnown()) suffix += "\nOrientasi belum pasti; gunakan tombol Putih↓/Hitam↓.";
+                  lastPlayedFrom = "";
+                  lastPlayedTo = "";
+                  lastMoveSymbol = "";
+                  analyzeCurrentPosition(update.fen, board, frameWidth, frameHeight, recognition,
+                          prefix + " · " + recognition.pieceCount + " bidak\nGiliran: " + turn + suffix);
+                  return;
+              }
+
+              String uci = update.move.toString();
+              lastPlayedFrom = uci.substring(0, 2);
+              lastPlayedTo = uci.substring(2, 4);
+              lastMoveSymbol = "…";
+              overlay.annotate(board, frameWidth, frameHeight, lastPlayedFrom, lastPlayedTo,
+                      "…", "", "", tracker.isWhiteBottom());
+              overlay.status("Langkah " + uci + " terbaca · Stockfish menilai di latar belakang…");
+
+              final String beforeFen = update.before.getFen();
+              final String afterFen = update.after.getFen();
+              final long request = analysisGeneration.incrementAndGet();
+              lastAnalyzedFen = afterFen;
+              lastEvaluation = null;
+              UciEngine active = engine;
+              if (active != null) active.stopSearch();
+
+              analysisWorker.submit(() -> {
+                  try {
+                      ensureEngine();
+                      if (request != analysisGeneration.get()) return;
+                      UciEngine.Evaluation before = engine.analyze(beforeFen, Math.max(180, thinkMs / 2));
+                      if (request != analysisGeneration.get()) return;
+                      UciEngine.Evaluation after = engine.analyze(afterFen, thinkMs);
+                      if (request != analysisGeneration.get()) return;
+
+                      MoveJudge.Result grade = MoveJudge.judge(update.before, update.after, update.move, before, after);
+                      lastEvaluation = after;
+                      lastAnalyzedBoard = new Rect(board);
+                      lastAnalyzedFrameWidth = frameWidth;
+                      lastAnalyzedFrameHeight = frameHeight;
+                      lastAnalysisPrefix = grade.symbol + " " + grade.name + " · " + uci + "\n" + grade.note
+                              + "\nCPL " + grade.centipawnsLost + " · Evaluasi " + after.description;
+                      lastMoveSymbol = grade.symbol;
+                      renderCachedAnalysis();
+                  } catch (Exception error) {
+                      if (request == analysisGeneration.get()) {
+                          lastAnalyzedFen = afterFen;
+                          lastEvaluation = null;
+                          overlay.status("Posisi terbaca, tetapi Stockfish gagal: " + error.getMessage());
+                      }
+                  }
+              });
+          }
+
+          private void analyzeCurrentPosition(String fen, Rect board, int frameWidth, int frameHeight,
+                                              PieceClassifier.Result recognition, String prefix) {
+              final long request = analysisGeneration.incrementAndGet();
+              lastAnalyzedFen = fen;
+              lastEvaluation = null;
+              lastAnalyzedBoard = null;
+              UciEngine active = engine;
+              if (active != null) active.stopSearch();
+              overlay.status(prefix + "\nStockfish menganalisis di latar belakang…");
+
+              analysisWorker.submit(() -> {
+                  try {
+                      ensureEngine();
+                      if (request != analysisGeneration.get()) return;
+                      UciEngine.Evaluation evaluation = engine.analyze(fen, thinkMs);
+                      if (request != analysisGeneration.get()) return;
+                      lastEvaluation = evaluation;
+                      lastAnalyzedBoard = new Rect(board);
+                      lastAnalyzedFrameWidth = frameWidth;
+                      lastAnalyzedFrameHeight = frameHeight;
+                      lastAnalysisPrefix = prefix + "\nEvaluasi " + evaluation.description
+                              + " · Akurasi pengenalan "
+                              + String.format(java.util.Locale.US, "%.0f%%", recognition.averageConfidence * 100);
+                      lastPlayedFrom = "";
+                      lastPlayedTo = "";
+                      lastMoveSymbol = "";
+                      renderCachedAnalysis();
+                  } catch (Exception error) {
+                      if (request == analysisGeneration.get()) {
+                          overlay.status(prefix + "\nStockfish belum siap: " + error.getMessage());
+                      }
+                  }
+              });
+          }
+
+          /** Selects the user's move and the opponent's predicted reply from the same PV. */
+          private void renderCachedAnalysis() {
+              UciEngine.Evaluation evaluation = lastEvaluation;
+              Rect board = lastAnalyzedBoard;
+              if (evaluation == null || board == null || overlay == null) return;
+
+              boolean whiteToMove = tracker.isWhiteToMove();
+              boolean userToMove = whiteToMove == playerWhite;
+              int myPly = userToMove ? 0 : 1;
+              int opponentPly = userToMove ? 1 : 0;
+              String myMove = showMyBest ? evaluation.moveAt(myPly) : "";
+              String opponentMove = showOpponentBest ? evaluation.moveAt(opponentPly) : "";
+              overlay.annotate(board, lastAnalyzedFrameWidth, lastAnalyzedFrameHeight,
+                      lastPlayedFrom, lastPlayedTo, lastMoveSymbol,
+                      myMove, opponentMove, tracker.isWhiteBottom());
+
+              StringBuilder status = new StringBuilder(lastAnalysisPrefix);
+              status.append("\nGiliran: ").append(whiteToMove ? "Putih" : "Hitam")
+                      .append(" · Kamu: ").append(playerWhite ? "Putih" : "Hitam");
+              if (showMyBest) status.append("\n").append(userToMove ? "Langkah terbaikmu: " : "Prediksi balasanmu: ")
+                      .append(myMove.isEmpty() ? "belum tersedia di PV" : myMove);
+              if (showOpponentBest) status.append("\n").append(userToMove ? "Prediksi langkah lawan: " : "Langkah terbaik lawan: ")
+                      .append(opponentMove.isEmpty() ? "belum tersedia di PV" : opponentMove);
+              status.append("\nHijau = kamu · Oranye putus-putus = prediksi lawan");
+              overlay.status(status.toString());
+          }
+
+          '''
+          src = replace_method(src, "private void handlePositionUpdate(",
+                                   "private void ensureEngine()", new_analysis_methods, "background Stockfish analysis")
+          src = replace_once(src, "worker.shutdownNow();",
+                                  "analysisGeneration.incrementAndGet();\n        if (engine != null) engine.stopSearch();\n        analysisWorker.shutdownNow();\n        worker.shutdownNow();",
+                                  "stop analysis worker on service destroy")
+          write_text(path, src)
+
+          # 6) Let a new position stop an older Stockfish search.
+          path = "app/src/main/java/id/chesslens/realtime/engine/UciEngine.java"
+          src = read_text(path)
+          src = replace_once(src,
+              "    @Override public void close() {\n        // Stop any in-flight search but keep the WebView worker alive for the next analysis session.\n        if (!closed) {\n            try { WasmEngineHost.send(\"stop\"); } catch (Exception ignored) { }\n        }\n        closed = true;\n    }",
+              "    public void stopSearch() {\n        if (!closed) {\n            try { WasmEngineHost.send(\"stop\"); } catch (Exception ignored) { }\n        }\n    }\n\n    @Override public void close() {\n        stopSearch();\n        closed = true;\n    }",
+              "engine stop method")
+          write_text(path, src)
+
+          # 7) Increment Android version.
+          path = "app/build.gradle"
+          src = read_text(path)
+          src = replace_once(src, "versionCode 6", "versionCode 7", "Android version code")
+          src = replace_once(src, "versionName '0.7.0'", "versionName '0.8.0'", "Android version name")
+          write_text(path, src)
+
+          required = [
+              "app/src/main/java/id/chesslens/realtime/vision/BoardFinder.java",
+              "app/src/main/java/id/chesslens/realtime/vision/PieceClassifier.java",
+              "app/src/main/java/id/chesslens/realtime/overlay/ArrowCanvas.java",
+              "app/src/main/java/id/chesslens/realtime/overlay/FloatingOverlay.java",
+              "app/src/main/java/id/chesslens/realtime/ScreenService.java",
+              "app/src/main/java/id/chesslens/realtime/engine/UciEngine.java",
+              "app/build.gradle",
+          ]
+          for name in required:
+              if name not in entries:
+                  raise SystemExit(f"Patched source missing: {name}")
+
+          with ZipFile(output_zip, "w", ZIP_DEFLATED, compresslevel=9) as archive:
+              for name, data in entries.items():
+                  info = infos.get(name)
+                  if info is None:
+                      archive.writestr(name, data)
+                  else:
+                      info.compress_type = ZIP_DEFLATED
+                      archive.writestr(info, data)
+
+          print(f"Created {output_zip} ({output_zip.stat().st_size} bytes)")
+          PY
+          python "$RUNNER_TEMP/apply_v08.py"
+
+      - name: Unpack patched v0.8 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s ChessLens-Realtime-v0.8-Performance-Optimization.zip
+          unzip -t ChessLens-Realtime-v0.8-Performance-Optimization.zip
+          unzip -oq ChessLens-Realtime-v0.8-Performance-Optimization.zip -d .
+          test -f app/src/main/java/id/chesslens/realtime/vision/PieceClassifier.java
+          grep -q "versionName '0.8.0'" app/build.gradle
+          grep -q 'analysisWorker' app/src/main/java/id/chesslens/realtime/ScreenService.java
+          grep -q 'lastFullBoardScanAt' app/src/main/java/id/chesslens/realtime/ScreenService.java
+          grep -q 'sourceWidth' app/src/main/java/id/chesslens/realtime/overlay/ArrowCanvas.java
+          grep -q 'hidePanel' app/src/main/java/id/chesslens/realtime/overlay/FloatingOverlay.java
+          grep -q 'getPixels(boardPixelBuffer' app/src/main/java/id/chesslens/realtime/vision/PieceClassifier.java
+          python tools/test_fen_mapping.py
+          python tools/test_learning_pv.py
+
+      - name: Set up Python for model conversion
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned model conversion tools
+        run: python -m pip install --disable-pip-version-check torch==2.7.1 safetensors==0.6.2 onnx==1.18.0 onnxruntime==1.22.1 numpy==2.2.6
+
+      - name: Download MIT chess-square classifier weights
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/chesslens-model" app/src/main/assets/models
+          curl --fail --location --retry 5 --retry-all-errors \
+            'https://huggingface.co/S1M0N38/chess-cv/resolve/main/pieces.safetensors' \
+            -o "$RUNNER_TEMP/chesslens-model/pieces.safetensors"
+          test "$(stat -c%s "$RUNNER_TEMP/chesslens-model/pieces.safetensors")" -gt 500000
+
+      - name: Convert model to ONNX and verify inference
+        run: |
+          python tools/convert_chess_cv_model.py \
+            --weights "$RUNNER_TEMP/chesslens-model/pieces.safetensors" \
+            --output app/src/main/assets/models/chess-pieces.onnx
+          test -s app/src/main/assets/models/chess-pieces.onnx
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Smoke-test UCI principal variation parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/uci-smoke"
+          javac -d "$RUNNER_TEMP/uci-smoke" \
+            tools/uci-smoke/id/chesslens/realtime/engine/WasmEngineHost.java \
+            app/src/main/java/id/chesslens/realtime/engine/UciEngine.java \
+            tools/uci-smoke/TestUciEngine.java
+          java -cp "$RUNNER_TEMP/uci-smoke" TestUciEngine
+
+      - name: Install Android API and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print | sort -V | tail -n 1)"
+          test -x "$sdkmanager_path"
+          set +o pipefail
+          yes | "$sdkmanager_path" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager_path" 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Download pinned Stockfish 18 WASM assets from npm registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache="$HOME/.cache/chesslens-stockfish-18.0.5"
+          mkdir -p "$cache" "$RUNNER_TEMP/stockfish-package"
+          js="$cache/stockfish-18-single.js"
+          wasm="$cache/stockfish-18-single.wasm"
+          if [[ ! -s "$js" || $(stat -c%s "$js") -lt 10000 || ! -s "$wasm" || $(stat -c%s "$wasm") -lt 100000000 ]]; then
+            pack_name="$(npm pack stockfish@18.0.5 --silent --pack-destination "$RUNNER_TEMP/stockfish-package")"
+            test -n "$pack_name"
+            tar -xzf "$RUNNER_TEMP/stockfish-package/$pack_name" -C "$RUNNER_TEMP/stockfish-package"
+            cp "$RUNNER_TEMP/stockfish-package/package/bin/stockfish-18-single.js" "$js"
+            cp "$RUNNER_TEMP/stockfish-package/package/bin/stockfish-18-single.wasm" "$wasm"
+          fi
+          js_sha="$(sha256sum "$js" | awk '{print $1}')"
+          wasm_sha="$(sha256sum "$wasm" | awk '{print $1}')"
+          engine_java="app/src/main/java/id/chesslens/realtime/engine/EngineInstaller.java"
+          host_java="app/src/main/java/id/chesslens/realtime/engine/WasmEngineHost.java"
+          sed -i 's#https://cdn.jsdelivr.net/npm/stockfish@18.0.5/bin/#https://unpkg.com/stockfish@18.0.5/bin/#g' "$engine_java"
+          sed -i 's/stockfish\.wasm/stockfish-18-single.wasm/g' "$engine_java"
+          sed -i 's#/engine/stockfish\.wasm#/engine/stockfish-18-single.wasm#g' "$host_java"
+          sed -i "s/__STOCKFISH_JS_SHA256__/$js_sha/g" "$engine_java"
+          sed -i "s/__STOCKFISH_WASM_SHA256__/$wasm_sha/g" "$engine_java"
+          ! grep -q '__STOCKFISH_.*_SHA256__' "$engine_java"
+          grep -q '/engine/stockfish-18-single.wasm' "$host_java"
+          echo "Stockfish JS SHA-256: $js_sha"
+          echo "Stockfish WASM SHA-256: $wasm_sha"
+
+      - name: Build debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK and package patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk"
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --verbose "$apk"
+          unzip -Z1 "$apk" | grep -q 'assets/models/chess-pieces.onnx'
+          if unzip -Z1 "$apk" | grep -Eiq 'stockfish.*\.(wasm|js)$|libstockfish'; then
+            echo 'Stockfish must remain an in-app download, not bundled in the installer.'
+            exit 1
+          fi
+          cp "$apk" ChessLens-Realtime-v0.8-debug.apk
+          echo "APK size: $(du -h "$apk" | cut -f1)"
+          "${ANDROID_HOME}/build-tools/34.0.0/aapt" dump badging "$apk" | grep -E "versionName='0.8.0'"
+
+      - name: Upload v0.8 APK and patched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessLens-Realtime-v0.8-Performance-Build
+          path: |
+            ChessLens-Realtime-v0.8-debug.apk
+            ChessLens-Realtime-v0.8-Performance-Optimization.zip
+          retention-days: 30
